@@ -36,11 +36,16 @@ class ExponentialGeometricAverage {
   public void addMeasurement(double measurement) {
     //0.95
     double keepConstant = 1 - mDecayConstant;
-    //这里都是在计算有效值，因为在几次的计算中肯定是有浮动的，如何取一个有效值就非常的重要
-    //注意这里有计算一个偏移量，简单理解就是平均值应该倾向之前计算的平均值，但是也有部分靠近当前计算的值
+    //因为在确信带宽状态稳定的情况下会进行多次计算，这里在确定这一段时间内的带宽平均大小
+    //注意这里有计算一个偏移量keepConstant，这个可以在ConnectionClassManager中定义
+    //这里在计算的时候没有直接均分，而是采用了比例
+    //直观地理解就是计算的次数越多，之前计算的结果占比就越大，新的带宽大小占比就低
+    //这个是用于计算在整个采样过程中的带宽大小，那么旧的结果占比大是正常的
     if (mCount > mCutover) {
       mValue = Math.exp(keepConstant * Math.log(mValue) + mDecayConstant * Math.log(measurement));
     } else if (mCount > 0) {
+      //keepConstant - （keepConstant）/(mCount + 1.0)
+      //mCount越大retained越大
       double retained = keepConstant * mCount / (mCount + 1.0);
       double newcomer = 1.0 - retained;
       mValue = Math.exp(retained * Math.log(mValue) + newcomer * Math.log(measurement));

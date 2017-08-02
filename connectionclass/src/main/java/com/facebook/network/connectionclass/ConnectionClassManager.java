@@ -26,7 +26,12 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class ConnectionClassManager {
 
-  /*package*/ static final double DEFAULT_SAMPLES_TO_QUALITY_CHANGE = 5;
+  /*package*/
+  //在检测带宽变化的时候，因为有的时候可能因为波动等原因导致过于短暂的变化
+  //检测时候是采用一定时间自动检测，那么就需要定义一个基础的检测次数
+  //用于规定什么时候带宽值的变化可以认为有效
+  static final double DEFAULT_SAMPLES_TO_QUALITY_CHANGE = 5;
+  //这个就是一个字节有8位的意思
   private static final int BYTES_TO_BITS = 8;
 
   /**
@@ -48,9 +53,13 @@ public class ConnectionClassManager {
    */
   private static final double DEFAULT_DECAY_CONSTANT = 0.05;
 
-  /** Current bandwidth of the user's connection depending upon the response. */
+  /**
+   * 实际进行当前带宽多大的计算器
+   * 内部有存储当前带宽大小
+   * */
   private ExponentialGeometricAverage mDownloadBandwidth
       = new ExponentialGeometricAverage(DEFAULT_DECAY_CONSTANT);
+  //用于标记当前带宽是否发生变化
   private volatile boolean mInitiateStateChange = false;
   //下面很多都是原子操作，简单的理解就是不用考虑多线程的问题
   //当前网络连接带宽的质量，具体看ConnectionQuality里面定义的参数
@@ -64,6 +73,7 @@ public class ConnectionClassManager {
   /**
    * The lower bound for measured bandwidth in bits/ms. Readings
    * lower than this are treated as effectively zero (therefore ignored).
+   * 测量的时候可以接受的在当前测量间隔内收到的最小字节位数
    */
   static final long BANDWIDTH_LOWER_BOUND = 10;
 
@@ -89,30 +99,33 @@ public class ConnectionClassManager {
    * Adds bandwidth to the current filtered latency counter. Sends a broadcast to all
    * {@link ConnectionClassStateChangeListener} if the counter moves from one bucket
    * to another (i.e. poor bandwidth -> moderate bandwidth).
-   * @param bytes 流量差值
-   * @param timeInMs 这些流量差值计算的时间
+   * @param bytes timeInMs这段时间内所收到的字节数
+   * @param timeInMs 计算的时间
    */
   public synchronized void addBandwidth(long bytes, long timeInMs) {
 
-    //Ignore garbage values.
-    //这些单位都要转为KB
-    //过滤无效数据
+    //1.当前计算时间必须>0
+    //2.当前间隔内所收到的包的字节数的位数必须大于预定义的最小值，默认10
     if (timeInMs == 0 || (bytes) * 1.0 / (timeInMs) * BYTES_TO_BITS < BANDWIDTH_LOWER_BOUND) {
       return;
     }
-    //当前所使用的的带宽kbps
+    //获得当前每毫秒所收到的字节位数
     double bandwidth = (bytes) * 1.0 / (timeInMs) * BYTES_TO_BITS;
-    //计算平均带宽并记录
+    //将当前数据传入计算器中进行计算，后续计算结果会保留在计算器中
     mDownloadBandwidth.addMeasurement(bandwidth);
-    //初始化此处都为false，主要用于过滤一开始从0到有的情况，这种时候带宽状态发生了变化是正常的，不应该进行回调
-    if (mInitiateStateChange) {
-      mSampleCounter += 1;
-      //当前带宽发生了变化，还原一些标记
+    if (mInitiateStateChange) {//当前带宽发生变化
+      mSampleCounter += 1;//带宽变化采样次数+1
+      //之前带宽变化的时候记录了带宽等级
+      //如果这次采样的时候带宽等级再一次发生变化
       if (getCurrentBandwidthQuality() != mNextBandwidthConnectionQuality.get()) {
+        //还原数据，等待之后的采样，因为认为当前是带宽波动，之前的计算无效
         mInitiateStateChange = false;
         mSampleCounter = 1;
       }
-      //至少要保持5次相同的带宽状态才认为这种状态是处于稳定的状况，否则可能存在偶然的情况，一般来说测量时间为1s的话，则这种稳定范围任务是5s
+      //1.至少要保持5次相同的带宽状态才认为这种状态是处于稳定的状况，否则可能存在偶然的情况，一般来说测量时间为1s的话，则这种稳定范围任务是5s
+      //2.进行状态变动回调的时候有一个最小变化大小范围
+      // 默认如果是变大，要求超过原来最大值 * 1.25
+      // 如果变小，要求至少小于等于原来的80%
       if (mSampleCounter >= DEFAULT_SAMPLES_TO_QUALITY_CHANGE  && significantlyOutsideCurrentBand()) {
         //还原标记
         mInitiateStateChange = false;
@@ -135,9 +148,21 @@ public class ConnectionClassManager {
   }
 
   /**
+   * Get the ConnectionQuality that the moving bandwidth average currently represents.
+   * 通过计算器中计算的结果得到当前带宽等级
+   * @return A ConnectionQuality representing the device's bandwidth at this exact moment.
+   */
+  public synchronized ConnectionQuality getCurrentBandwidthQuality() {
+    if (mDownloadBandwidth == null) {
+      return ConnectionQuality.UNKNOWN;
+    }
+    return mapBandwidthQuality(mDownloadBandwidth.getAverage());
+  }
+
+  /**
    * 校验变化的正确性和确立变化的范围
    * @return true认为是有效的变化
-     */
+   */
   private boolean  significantlyOutsideCurrentBand() {
     if (mDownloadBandwidth == null) {
       // Make Infer happy. It wouldn't make any sense to call this while mDownloadBandwidth is null.
@@ -179,27 +204,13 @@ public class ConnectionClassManager {
   }
 
   /**
-   * Resets the bandwidth average for this instance of the bandwidth manager.
+   * 根据当前带宽的平均值进行映射
+   * 然后返回预定义的带宽等级
+   * @param average 当前带宽的平均值
+   * @return 当前带宽的预定义等级
    */
-  public void reset() {
-    if (mDownloadBandwidth != null) {
-      mDownloadBandwidth.reset();
-    }
-    mCurrentBandwidthConnectionQuality.set(ConnectionQuality.UNKNOWN);
-  }
-
-  /**
-   * Get the ConnectionQuality that the moving bandwidth average currently represents.
-   * @return A ConnectionQuality representing the device's bandwidth at this exact moment.
-   */
-  public synchronized ConnectionQuality getCurrentBandwidthQuality() {
-    if (mDownloadBandwidth == null) {
-      return ConnectionQuality.UNKNOWN;
-    }
-    return mapBandwidthQuality(mDownloadBandwidth.getAverage());
-  }
-
   private ConnectionQuality mapBandwidthQuality(double average) {
+    //这个定义实际上看ConnectionQuality也明白
     if (average < 0) {
       return ConnectionQuality.UNKNOWN;
     }
@@ -213,17 +224,6 @@ public class ConnectionClassManager {
       return ConnectionQuality.GOOD;
     }
     return ConnectionQuality.EXCELLENT;
-  }
-
-
-  /**
-   * Accessor method for the current bandwidth average.
-   * @return The current bandwidth average, or -1 if no average has been recorded.
-   */
-  public synchronized double getDownloadKBitsPerSecond() {
-    return mDownloadBandwidth == null
-        ? -1.0
-        : mDownloadBandwidth.getAverage();
   }
 
   /**
@@ -271,5 +271,26 @@ public class ConnectionClassManager {
     for (int i = 0; i < size; i++) {
       mListenerList.get(i).onBandwidthStateChange(mCurrentBandwidthConnectionQuality.get());
     }
+  }
+
+  /**
+   * Accessor method for the current bandwidth average.
+   * @return The current bandwidth average, or -1 if no average has been recorded.
+   */
+  public synchronized double getDownloadKBitsPerSecond() {
+    return mDownloadBandwidth == null
+            ? -1.0
+            : mDownloadBandwidth.getAverage();
+  }
+
+
+  /**
+   * Resets the bandwidth average for this instance of the bandwidth manager.
+   */
+  public void reset() {
+    if (mDownloadBandwidth != null) {
+      mDownloadBandwidth.reset();
+    }
+    mCurrentBandwidthConnectionQuality.set(ConnectionQuality.UNKNOWN);
   }
 }
